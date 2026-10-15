@@ -1,24 +1,44 @@
 import { redis } from "../redis.js";
 
+const LOCK_TTL_S = 5;      // lock auto-expires if the winner crashes mid-fetch
+const WAIT_MS = 50;        // how long a loser sleeps before re-reading the cache
+const MAX_WAITS = 20;      // ~1s of waiting before giving up and querying directly
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 /**
- * cached(key, ttl, fetcher) — YOUR JOB.
+ * cached(key, ttl, fetcher) — cache-aside with stampede protection.
  *
- * Turn this into a cache-aside helper WITH stampede protection.
- * Right now it does NO caching — it just runs the fetcher every time,
- * so the endpoints work but are slow and unprotected.
- *
- * Implement, in order:
- *   1. redis.get(key) — on a HIT, JSON.parse and return it (no DB).
- *   2. On a MISS, take a stampede lock so only ONE request does the work:
- *        const got = await redis.set("lock:" + key, "1", "NX", "EX", 5);
- *      - if got: run fetcher(), SET the key with an EX ttl, DEL the lock, return.
- *      - else (someone else holds the lock): sleep ~50ms, re-read the cache,
- *        return that (or fall back to fetcher() if still empty).
- *
- * The worked reference is the cached() helper from the lesson — study it,
- * then write your own here.
+ *   1. GET key — on a HIT, parse and return (no DB).
+ *   2. On a MISS, race for `SET lock:<key> 1 NX EX 5`:
+ *      - the winner runs fetcher(), SETs the value with EX ttl, releases the lock;
+ *      - everyone else sleeps ~50ms and re-reads the cache instead of hitting the DB.
  */
 export async function cached(key, ttl, fetcher) {
-  // TODO: replace this naive passthrough with cache-aside + SET ... NX EX lock.
+  const hit = await redis.get(key);
+  if (hit !== null) return JSON.parse(hit);
+
+  const lockKey = "lock:" + key;
+  const got = await redis.set(lockKey, "1", "NX", "EX", LOCK_TTL_S);
+
+  if (got) {
+    try {
+      const value = await fetcher();
+      await redis.set(key, JSON.stringify(value), "EX", ttl);
+      return value;
+    } finally {
+      await redis.del(lockKey);
+    }
+  }
+
+  // Someone else is rebuilding this key — wait for their result rather than
+  // piling onto the database.
+  for (let i = 0; i < MAX_WAITS; i++) {
+    await sleep(WAIT_MS);
+    const again = await redis.get(key);
+    if (again !== null) return JSON.parse(again);
+  }
+
+  // Winner is slow or crashed; fall back to the DB so this request still succeeds.
   return fetcher();
 }
